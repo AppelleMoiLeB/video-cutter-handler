@@ -3,52 +3,49 @@ import subprocess
 import requests
 import tempfile
 import os
+import dropbox
 
 def handler(event):
     try:
         print("Début du traitement")
         video_url = event['input']['video_url']
         cuts = event['input']['cuts']
+        dropbox_folder = event['input'].get('dropbox_folder', '/processed_videos/')  # Dossier par défaut
+        dropbox_token = event['input']['dropbox_token']  # Token depuis Make.com
         
-        print(f"URL vidéo: {video_url}")
-        print(f"Découpes: {cuts}")
+        print(f"Upload vers: {dropbox_folder}")
         
-        # Télécharge la vidéo
-        print("Téléchargement de la vidéo...")
-        response = requests.get(video_url, stream=True)
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_video:
-            for chunk in response.iter_content(chunk_size=8192):
-                temp_video.write(chunk)
-            input_path = temp_video.name
+        # ... code de téléchargement et découpe existant ...
         
-        print(f"Vidéo téléchargée: {input_path}")
+        # Après la découpe FFMPEG réussie
+        print(f"Upload vers Dropbox: {dropbox_folder}")
         
-        # Découpe avec FFMPEG
-        output_path = '/tmp/output.mp4'
-        start = cuts[0]['start']
-        end = cuts[0]['end']
+        # Connexion Dropbox
+        dbx = dropbox.Dropbox(dropbox_token)
         
-        print(f"Découpe de {start}s à {end}s")
+        # Nom de fichier avec timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"video_cut_{timestamp}.mp4"
+        dropbox_path = f"{dropbox_folder.rstrip('/')}/{filename}"
         
-        cmd = ['ffmpeg', '-i', input_path, '-ss', str(start), '-to', str(end), '-c', 'copy', '-y', output_path]
+        # Upload
+        with open(output_path, 'rb') as f:
+            dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode.overwrite)
         
-        print(f"Commande FFMPEG: {' '.join(cmd)}")
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print(f"Erreur FFMPEG: {result.stderr}")
-            return {"error": f"FFMPEG failed: {result.stderr}"}
-        
-        file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-        
-        print(f"Traitement terminé, taille: {file_size} bytes")
+        # Créer lien de partage
+        try:
+            shared_link = dbx.sharing_create_shared_link(dropbox_path)
+            download_url = shared_link.url
+        except:
+            download_url = f"File uploaded to {dropbox_path}"
         
         return {
-            "success": True, 
-            "message": "Video processed successfully",
-            "output_size_mb": round(file_size / 1024 / 1024, 2),
-            "duration_cut": end - start
+            "success": True,
+            "message": "Video processed and uploaded to Dropbox",
+            "dropbox_path": dropbox_path,
+            "download_url": download_url,
+            "output_size_mb": round(file_size / 1024 / 1024, 2)
         }
         
     except Exception as e:
