@@ -29,7 +29,7 @@ def handler(event):
         print(f"Vidéo téléchargée: {input_path}")
         
         # Découpe avec FFMPEG
-        output_path = '/tmp/output.mp4'  # CORRECTION: Définir output_path ici
+        output_path = '/tmp/output.mp4'
         start = cuts[0]['start']
         end = cuts[0]['end']
         
@@ -48,7 +48,7 @@ def handler(event):
         file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
         print(f"Traitement terminé, taille: {file_size} bytes")
         
-        # Upload vers Dropbox
+        # Upload vers Dropbox avec chunks
         print(f"Upload vers Dropbox: {dropbox_folder}")
         
         dbx = dropbox.Dropbox(dropbox_token)
@@ -58,19 +58,69 @@ def handler(event):
         filename = f"video_cut_{timestamp}.mp4"
         dropbox_path = f"{dropbox_folder.rstrip('/')}/{filename}"
         
-        # Upload
-        with open(output_path, 'rb') as f:
-            dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+        # Upload par chunks pour gros fichiers
+        CHUNK_SIZE = 4 * 1024 * 1024  # 4MB par chunk
         
-        print(f"Fichier uploadé: {dropbox_path}")
+        with open(output_path, 'rb') as f:
+            if file_size <= CHUNK_SIZE:
+                # Fichier petit, upload normal
+                print("Upload direct (fichier < 4MB)")
+                contents = f.read()
+                dbx.files_upload(contents, dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+            else:
+                # Fichier gros, upload par sessions
+                print(f"Upload par chunks ({file_size} bytes, chunks de {CHUNK_SIZE} bytes)")
+                
+                # Premier chunk
+                first_chunk = f.read(CHUNK_SIZE)
+                session_start_result = dbx.files_upload_session_start(first_chunk)
+                cursor = dropbox.files.UploadSessionCursor(
+                    session_id=session_start_result.session_id,
+                    offset=f.tell()
+                )
+                
+                print(f"Session démarrée: {session_start_result.session_id}")
+                
+                # Upload des chunks suivants
+                chunk_count = 1
+                while f.tell() < file_size:
+                    chunk_count += 1
+                    remaining = file_size - f.tell()
+                    
+                    if remaining <= CHUNK_SIZE:
+                        # Dernier chunk
+                        print(f"Upload chunk final {chunk_count} ({remaining} bytes)")
+                        final_chunk = f.read(remaining)
+                        dbx.files_upload_session_finish(
+                            final_chunk,
+                            cursor,
+                            dropbox.files.CommitInfo(path=dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+                        )
+                        break
+                    else:
+                        # Chunk intermédiaire
+                        print(f"Upload chunk {chunk_count} ({CHUNK_SIZE} bytes)")
+                        chunk_data = f.read(CHUNK_SIZE)
+                        dbx.files_upload_session_append_v2(chunk_data, cursor)
+                        cursor.offset = f.tell()
+        
+        print(f"Fichier uploadé avec succès: {dropbox_path}")
         
         # Créer lien de partage
         try:
             shared_link = dbx.sharing_create_shared_link(dropbox_path)
             download_url = shared_link.url
+            print(f"Lien de partage créé: {download_url}")
         except Exception as e:
             print(f"Erreur création lien: {e}")
             download_url = f"File uploaded to {dropbox_path}"
+        
+        # Nettoyage des fichiers temporaires
+        try:
+            os.unlink(input_path)
+            os.unlink(output_path)
+        except:
+            pass
         
         return {
             "success": True,
@@ -78,7 +128,8 @@ def handler(event):
             "dropbox_path": dropbox_path,
             "download_url": download_url,
             "output_size_mb": round(file_size / 1024 / 1024, 2),
-            "duration_cut": end - start
+            "duration_cut": end - start,
+            "chunks_uploaded": chunk_count if file_size > CHUNK_SIZE else 1
         }
         
     except Exception as e:
