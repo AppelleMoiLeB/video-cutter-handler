@@ -18,24 +18,21 @@ def invert_cuts_to_keeps(cuts, total_duration):
     print(f"Cuts triés: {cuts_sorted}")
     print(f"Durée totale: {total_duration}")
     
-    # Segment avant le premier cut
-    if cuts_sorted[0]['start'] > 0.1:  # Si > 100ms
-        keeps.append({"start": 0, "end": cuts_sorted[0]['start']})
-        print(f"Segment initial: 0 → {cuts_sorted[0]['start']}")
+    current_pos = 0
     
-    # Segments entre les cuts
-    for i in range(len(cuts_sorted) - 1):
-        start = cuts_sorted[i]['end']
-        end = cuts_sorted[i + 1]['start']
-        if end > start + 0.1:  # Garder seulement si > 100ms
-            keeps.append({"start": start, "end": end})
-            print(f"Segment entre cuts: {start} → {end}")
+    for cut in cuts_sorted:
+        # Ajouter segment avant ce cut (si il y en a un)
+        if current_pos < cut['start'] and (cut['start'] - current_pos) > 0.1:
+            keeps.append({"start": current_pos, "end": cut['start']})
+            print(f"Segment gardé: {current_pos} → {cut['start']}")
+        
+        # Avancer la position après ce cut
+        current_pos = max(current_pos, cut['end'])
     
-    # Segment après le dernier cut
-    last_cut_end = cuts_sorted[-1]['end']
-    if last_cut_end < total_duration - 0.1:
-        keeps.append({"start": last_cut_end, "end": total_duration})
-        print(f"Segment final: {last_cut_end} → {total_duration}")
+    # Segment final après le dernier cut
+    if current_pos < total_duration - 0.1:
+        keeps.append({"start": current_pos, "end": total_duration})
+        print(f"Segment final: {current_pos} → {total_duration}")
     
     print(f"Segments à garder générés: {keeps}")
     return keeps
@@ -122,6 +119,12 @@ def handler(event):
         if not processed_segments:
             return {"error": "Aucun segment à garder après inversion"}
         
+        print("=== DEBUG SEGMENTS À GARDER ===")
+        for i, keep in enumerate(processed_segments):
+            duration = keep['end'] - keep['start']
+            print(f"Segment gardé {i}: {keep['start']:.3f}s → {keep['end']:.3f}s (durée: {duration:.3f}s)")
+        print("===============================")
+        
         # Analyse du fichier pour détecter audio/vidéo
         probe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', input_path]
         probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
@@ -152,6 +155,7 @@ def handler(event):
             if has_video and has_audio:
                 # Fichier vidéo avec audio
                 filter_parts = []
+                valid_segment_count = 0
                 
                 for i, segment in enumerate(processed_segments):
                     start = segment['start']
@@ -159,84 +163,113 @@ def handler(event):
                     if duration < 0.1:  # Ignorer segments trop courts
                         print(f"Segment {i} ignoré (trop court): {duration}s")
                         continue
-                    filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{i}]")
-                    filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{i}]")
+                    filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{valid_segment_count}]")
+                    filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{valid_segment_count}]")
+                    valid_segment_count += 1
                 
                 if not filter_parts:
                     return {"error": "Tous les segments sont trop courts"}
                 
-                # Compter les segments valides
-                valid_segments = len(filter_parts) // 2
-                
-                # Concaténer tous les segments
-                video_inputs = ''.join([f"[v{i}]" for i in range(valid_segments)])
-                audio_inputs = ''.join([f"[a{i}]" for i in range(valid_segments)])
-                concat_filter = f"{video_inputs}concat=n={valid_segments}:v=1:a=0[outv]"
-                concat_filter += f";{audio_inputs}concat=n={valid_segments}:v=0:a=1[outa]"
-                
-                full_filter = ';'.join(filter_parts) + ';' + concat_filter
-                
-                cmd = [
-                    'ffmpeg', '-i', input_path,
-                    '-filter_complex', full_filter,
-                    '-map', '[outv]', '-map', '[outa]',
-                    '-c:v', 'libx264', '-c:a', 'aac',
-                    '-y', output_path
-                ]
+                if valid_segment_count == 1:
+                    # Un seul segment valide, pas de concat nécessaire
+                    full_filter = ';'.join(filter_parts)
+                    cmd = [
+                        'ffmpeg', '-i', input_path,
+                        '-filter_complex', full_filter,
+                        '-map', '[v0]', '-map', '[a0]',
+                        '-c:v', 'libx264', '-c:a', 'aac',
+                        '-y', output_path
+                    ]
+                else:
+                    # Concaténer tous les segments
+                    video_inputs = ''.join([f"[v{i}]" for i in range(valid_segment_count)])
+                    audio_inputs = ''.join([f"[a{i}]" for i in range(valid_segment_count)])
+                    concat_filter = f"{video_inputs}concat=n={valid_segment_count}:v=1:a=0[outv]"
+                    concat_filter += f";{audio_inputs}concat=n={valid_segment_count}:v=0:a=1[outa]"
+                    
+                    full_filter = ';'.join(filter_parts) + ';' + concat_filter
+                    
+                    cmd = [
+                        'ffmpeg', '-i', input_path,
+                        '-filter_complex', full_filter,
+                        '-map', '[outv]', '-map', '[outa]',
+                        '-c:v', 'libx264', '-c:a', 'aac',
+                        '-y', output_path
+                    ]
                 
             elif has_audio and not has_video:
                 # Fichier audio uniquement
                 filter_parts = []
+                valid_segment_count = 0
                 
                 for i, segment in enumerate(processed_segments):
                     start = segment['start']
                     duration = segment['end'] - segment['start']
                     if duration < 0.1:
                         continue
-                    filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{i}]")
+                    filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{valid_segment_count}]")
+                    valid_segment_count += 1
                 
                 if not filter_parts:
                     return {"error": "Tous les segments audio sont trop courts"}
                 
-                valid_segments = len(filter_parts)
-                audio_inputs = ''.join([f"[a{i}]" for i in range(valid_segments)])
-                concat_filter = f"{audio_inputs}concat=n={valid_segments}:v=0:a=1[outa]"
-                
-                full_filter = ';'.join(filter_parts) + ';' + concat_filter
-                
-                cmd = [
-                    'ffmpeg', '-i', input_path,
-                    '-filter_complex', full_filter,
-                    '-map', '[outa]',
-                    '-c:a', 'aac', '-y', output_path
-                ]
+                if valid_segment_count == 1:
+                    full_filter = ';'.join(filter_parts)
+                    cmd = [
+                        'ffmpeg', '-i', input_path,
+                        '-filter_complex', full_filter,
+                        '-map', '[a0]',
+                        '-c:a', 'aac', '-y', output_path
+                    ]
+                else:
+                    audio_inputs = ''.join([f"[a{i}]" for i in range(valid_segment_count)])
+                    concat_filter = f"{audio_inputs}concat=n={valid_segment_count}:v=0:a=1[outa]"
+                    
+                    full_filter = ';'.join(filter_parts) + ';' + concat_filter
+                    
+                    cmd = [
+                        'ffmpeg', '-i', input_path,
+                        '-filter_complex', full_filter,
+                        '-map', '[outa]',
+                        '-c:a', 'aac', '-y', output_path
+                    ]
                 
             elif has_video and not has_audio:
                 # Fichier vidéo sans audio
                 filter_parts = []
+                valid_segment_count = 0
                 
                 for i, segment in enumerate(processed_segments):
                     start = segment['start']
                     duration = segment['end'] - segment['start']
                     if duration < 0.1:
                         continue
-                    filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{i}]")
+                    filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{valid_segment_count}]")
+                    valid_segment_count += 1
                 
                 if not filter_parts:
                     return {"error": "Tous les segments vidéo sont trop courts"}
                 
-                valid_segments = len(filter_parts)
-                video_inputs = ''.join([f"[v{i}]" for i in range(valid_segments)])
-                concat_filter = f"{video_inputs}concat=n={valid_segments}:v=1:a=0[outv]"
-                
-                full_filter = ';'.join(filter_parts) + ';' + concat_filter
-                
-                cmd = [
-                    'ffmpeg', '-i', input_path,
-                    '-filter_complex', full_filter,
-                    '-map', '[outv]',
-                    '-c:v', 'libx264', '-y', output_path
-                ]
+                if valid_segment_count == 1:
+                    full_filter = ';'.join(filter_parts)
+                    cmd = [
+                        'ffmpeg', '-i', input_path,
+                        '-filter_complex', full_filter,
+                        '-map', '[v0]',
+                        '-c:v', 'libx264', '-y', output_path
+                    ]
+                else:
+                    video_inputs = ''.join([f"[v{i}]" for i in range(valid_segment_count)])
+                    concat_filter = f"{video_inputs}concat=n={valid_segment_count}:v=1:a=0[outv]"
+                    
+                    full_filter = ';'.join(filter_parts) + ';' + concat_filter
+                    
+                    cmd = [
+                        'ffmpeg', '-i', input_path,
+                        '-filter_complex', full_filter,
+                        '-map', '[outv]',
+                        '-c:v', 'libx264', '-y', output_path
+                    ]
             else:
                 return {"error": "Aucun stream audio ou vidéo détecté"}
         
