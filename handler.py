@@ -4,6 +4,7 @@ import requests
 import tempfile
 import os
 import dropbox
+import json
 from datetime import datetime
 
 def handler(event):
@@ -34,17 +35,21 @@ def handler(event):
         
         print(f"Segments extraits: {len(segments) if isinstance(segments, list) else 'format invalide'}")
         
-        # Conversion des segments en format numérique (millisecondes vers secondes)
+        # Conversion des segments en format numérique
         processed_segments = []
         for segment in segments:
             try:
-                # Les timestamps du JSON consolidé sont déjà en millisecondes
-                start_ms = float(segment['start'])
-                end_ms = float(segment['end'])
+                # Normalisation des timestamps (gérer ms/s selon la valeur)
+                start_val = float(segment['start'])
+                end_val = float(segment['end'])
                 
-                # Convertir en secondes pour FFMPEG
-                start_sec = start_ms / 1000
-                end_sec = end_ms / 1000
+                # Si valeurs > 1000, probablement en millisecondes
+                if start_val > 1000:
+                    start_sec = start_val / 1000
+                    end_sec = end_val / 1000
+                else:
+                    start_sec = start_val
+                    end_sec = end_val
                 
                 processed_segments.append({"start": start_sec, "end": end_sec})
                 print(f"Segment traité: {start_sec}s → {end_sec}s (type: {segment.get('type', 'unknown')})")
@@ -69,7 +74,20 @@ def handler(event):
         
         print(f"Vidéo téléchargée: {input_path}")
         
-        # Création des filtres FFMPEG pour concaténer tous les segments
+        # Analyse du fichier pour détecter audio/vidéo
+        probe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', input_path]
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        
+        if probe_result.returncode != 0:
+            print(f"Erreur ffprobe: {probe_result.stderr}")
+            return {"error": f"Erreur analyse fichier: {probe_result.stderr}"}
+        
+        probe_data = json.loads(probe_result.stdout)
+        has_video = any(stream['codec_type'] == 'video' for stream in probe_data['streams'])
+        has_audio = any(stream['codec_type'] == 'audio' for stream in probe_data['streams'])
+        
+        print(f"Analyse fichier - Vidéo: {has_video}, Audio: {has_audio}")
+        
         output_path = '/tmp/output.mp4'
         
         if len(processed_segments) == 1:
@@ -82,30 +100,76 @@ def handler(event):
                 '-c', 'copy', '-y', output_path
             ]
         else:
-            # Plusieurs segments : utiliser filter_complex pour concaténation
-            filter_parts = []
-            
-            for i, segment in enumerate(processed_segments):
-                start = segment['start']
-                duration = segment['end'] - segment['start']
-                filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{i}]")
-                filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{i}]")
-            
-            # Concaténer tous les segments
-            video_inputs = ''.join([f"[v{i}]" for i in range(len(processed_segments))])
-            audio_inputs = ''.join([f"[a{i}]" for i in range(len(processed_segments))])
-            concat_filter = f"{video_inputs}concat=n={len(processed_segments)}:v=1:a=0[outv]"
-            concat_filter += f";{audio_inputs}concat=n={len(processed_segments)}:v=0:a=1[outa]"
-            
-            full_filter = ';'.join(filter_parts) + ';' + concat_filter
-            
-            cmd = [
-                'ffmpeg', '-i', input_path,
-                '-filter_complex', full_filter,
-                '-map', '[outv]', '-map', '[outa]',
-                '-c:v', 'libx264', '-c:a', 'aac',
-                '-y', output_path
-            ]
+            # Plusieurs segments : filtres selon type de média
+            if has_video and has_audio:
+                # Fichier vidéo avec audio
+                filter_parts = []
+                
+                for i, segment in enumerate(processed_segments):
+                    start = segment['start']
+                    duration = segment['end'] - segment['start']
+                    filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{i}]")
+                    filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{i}]")
+                
+                # Concaténer tous les segments
+                video_inputs = ''.join([f"[v{i}]" for i in range(len(processed_segments))])
+                audio_inputs = ''.join([f"[a{i}]" for i in range(len(processed_segments))])
+                concat_filter = f"{video_inputs}concat=n={len(processed_segments)}:v=1:a=0[outv]"
+                concat_filter += f";{audio_inputs}concat=n={len(processed_segments)}:v=0:a=1[outa]"
+                
+                full_filter = ';'.join(filter_parts) + ';' + concat_filter
+                
+                cmd = [
+                    'ffmpeg', '-i', input_path,
+                    '-filter_complex', full_filter,
+                    '-map', '[outv]', '-map', '[outa]',
+                    '-c:v', 'libx264', '-c:a', 'aac',
+                    '-y', output_path
+                ]
+                
+            elif has_audio and not has_video:
+                # Fichier audio uniquement
+                filter_parts = []
+                
+                for i, segment in enumerate(processed_segments):
+                    start = segment['start']
+                    duration = segment['end'] - segment['start']
+                    filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{i}]")
+                
+                audio_inputs = ''.join([f"[a{i}]" for i in range(len(processed_segments))])
+                concat_filter = f"{audio_inputs}concat=n={len(processed_segments)}:v=0:a=1[outa]"
+                
+                full_filter = ';'.join(filter_parts) + ';' + concat_filter
+                
+                cmd = [
+                    'ffmpeg', '-i', input_path,
+                    '-filter_complex', full_filter,
+                    '-map', '[outa]',
+                    '-c:a', 'aac', '-y', output_path
+                ]
+                
+            elif has_video and not has_audio:
+                # Fichier vidéo sans audio
+                filter_parts = []
+                
+                for i, segment in enumerate(processed_segments):
+                    start = segment['start']
+                    duration = segment['end'] - segment['start']
+                    filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{i}]")
+                
+                video_inputs = ''.join([f"[v{i}]" for i in range(len(processed_segments))])
+                concat_filter = f"{video_inputs}concat=n={len(processed_segments)}:v=1:a=0[outv]"
+                
+                full_filter = ';'.join(filter_parts) + ';' + concat_filter
+                
+                cmd = [
+                    'ffmpeg', '-i', input_path,
+                    '-filter_complex', full_filter,
+                    '-map', '[outv]',
+                    '-c:v', 'libx264', '-y', output_path
+                ]
+            else:
+                return {"error": "Aucun stream audio ou vidéo détecté"}
         
         print(f"Commande FFMPEG: {' '.join(cmd)}")
         
@@ -191,8 +255,8 @@ def handler(event):
                             mode=dropbox.files.WriteMode.add,
                             autorename=True
                         )
-                        result = dbx.files_upload_session_finish(final_chunk, cursor, commit_info)
-                        dropbox_path = result.path_display
+                        result_upload = dbx.files_upload_session_finish(final_chunk, cursor, commit_info)
+                        dropbox_path = result_upload.path_display
                         filename = dropbox_path.split('/')[-1]
                         break
                     else:
@@ -232,6 +296,7 @@ def handler(event):
             "segments_processed": len(processed_segments),
             "total_duration_kept": round(total_duration, 2),
             "chunks_uploaded": chunk_count if file_size > CHUNK_SIZE else 1,
+            "media_type": f"video: {has_video}, audio: {has_audio}",
             "security_mode": "safe_upload_no_overwrite"
         }
         
