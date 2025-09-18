@@ -15,26 +15,51 @@ def invert_cuts_to_keeps(cuts, total_duration):
     keeps = []
     cuts_sorted = sorted(cuts, key=lambda x: x['start'])
     
-    print(f"Cuts triés: {cuts_sorted}")
+    print(f"=== DEBUG INVERSION ===")
     print(f"Durée totale: {total_duration}")
+    print(f"Nombre de cuts: {len(cuts_sorted)}")
+    
+    for i, cut in enumerate(cuts_sorted):
+        print(f"Cut {i}: {cut['start']} → {cut['end']}")
     
     current_pos = 0
     
-    for cut in cuts_sorted:
-        # Ajouter segment avant ce cut (si il y en a un)
-        if current_pos < cut['start'] and (cut['start'] - current_pos) > 0.1:
-            keeps.append({"start": current_pos, "end": cut['start']})
-            print(f"Segment gardé: {current_pos} → {cut['start']}")
+    for i, cut in enumerate(cuts_sorted):
+        print(f"\nTraitement cut {i}: {cut['start']} → {cut['end']}")
+        print(f"Position actuelle: {current_pos}")
         
-        # Avancer la position après ce cut
+        # Ajouter segment avant ce cut
+        gap_duration = cut['start'] - current_pos
+        print(f"Gap avant cut: {gap_duration}s")
+        
+        if current_pos < cut['start'] and gap_duration > 0.1:
+            segment = {"start": current_pos, "end": cut['start']}
+            keeps.append(segment)
+            print(f"✓ Segment ajouté: {current_pos} → {cut['start']} (durée: {gap_duration}s)")
+        else:
+            print(f"✗ Gap ignoré (trop court ou négatif)")
+        
+        # Avancer après ce cut
         current_pos = max(current_pos, cut['end'])
+        print(f"Nouvelle position: {current_pos}")
     
-    # Segment final après le dernier cut
+    # Segment final
+    final_gap = total_duration - current_pos
+    print(f"\nSegment final potentiel: {current_pos} → {total_duration} (durée: {final_gap}s)")
+    
     if current_pos < total_duration - 0.1:
-        keeps.append({"start": current_pos, "end": total_duration})
-        print(f"Segment final: {current_pos} → {total_duration}")
+        segment = {"start": current_pos, "end": total_duration}
+        keeps.append(segment)
+        print(f"✓ Segment final ajouté: {current_pos} → {total_duration}")
+    else:
+        print(f"✗ Segment final ignoré")
     
-    print(f"Segments à garder générés: {keeps}")
+    print(f"\nRésultat final: {len(keeps)} segments à garder")
+    for i, keep in enumerate(keeps):
+        duration = keep['end'] - keep['start']
+        print(f"Segment {i}: {keep['start']} → {keep['end']} (durée: {duration}s)")
+    print("===================")
+    
     return keeps
 
 def handler(event):
@@ -117,13 +142,15 @@ def handler(event):
         processed_segments = invert_cuts_to_keeps(cuts_to_remove, total_duration)
         
         if not processed_segments:
-            return {"error": "Aucun segment à garder après inversion"}
+            print("ERREUR: Aucun segment généré après inversion")
+            print("Cela peut signifier que tous les cuts couvrent la totalité du fichier")
+            return {"error": "Aucun segment à garder après inversion - vérifiez que les cuts ne couvrent pas tout le fichier"}
         
-        print("=== DEBUG SEGMENTS À GARDER ===")
+        print("=== SEGMENTS À TRAITER PAR FFMPEG ===")
         for i, keep in enumerate(processed_segments):
             duration = keep['end'] - keep['start']
-            print(f"Segment gardé {i}: {keep['start']:.3f}s → {keep['end']:.3f}s (durée: {duration:.3f}s)")
-        print("===============================")
+            print(f"Segment FFMPEG {i}: {keep['start']:.3f}s → {keep['end']:.3f}s (durée: {duration:.3f}s)")
+        print("=====================================")
         
         # Analyse du fichier pour détecter audio/vidéo
         probe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', input_path]
@@ -144,6 +171,7 @@ def handler(event):
         if len(processed_segments) == 1:
             # Un seul segment : découpe simple
             segment = processed_segments[0]
+            print(f"Découpe simple: {segment['start']} → {segment['end']}")
             cmd = [
                 'ffmpeg', '-i', input_path,
                 '-ss', str(segment['start']),
@@ -160,6 +188,7 @@ def handler(event):
                 for i, segment in enumerate(processed_segments):
                     start = segment['start']
                     duration = segment['end'] - segment['start']
+                    print(f"Préparation segment {i}: start={start}, duration={duration}")
                     if duration < 0.1:  # Ignorer segments trop courts
                         print(f"Segment {i} ignoré (trop court): {duration}s")
                         continue
@@ -168,7 +197,9 @@ def handler(event):
                     valid_segment_count += 1
                 
                 if not filter_parts:
-                    return {"error": "Tous les segments sont trop courts"}
+                    return {"error": "Tous les segments sont trop courts après filtrage"}
+                
+                print(f"Segments valides pour FFMPEG: {valid_segment_count}")
                 
                 if valid_segment_count == 1:
                     # Un seul segment valide, pas de concat nécessaire
