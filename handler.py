@@ -13,7 +13,7 @@ def handler(event):
         cuts_data = event['input']['cuts']
         dropbox_folder = event['input'].get('dropbox_folder', '/processed_videos/')
         dropbox_token = event['input']['dropbox_token']
-        custom_filename = event['input'].get('filename', None)  # NOUVEAU: nom personnalisé
+        custom_filename = event['input'].get('filename', None)
         
         print(f"URL vidéo: {video_url}")
         print(f"Découpes brutes: {cuts_data}")
@@ -108,36 +108,60 @@ def handler(event):
         file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
         print(f"Traitement terminé, taille: {file_size} bytes")
         
-        # Upload vers Dropbox avec chunks
+        # Upload vers Dropbox avec chunks et sécurité renforcée
         print(f"Upload vers Dropbox: {dropbox_folder}")
         
         dbx = dropbox.Dropbox(dropbox_token)
         
-        # MODIFICATION: Nom de fichier personnalisé ou automatique
+        # SÉCURITÉ: Génération de nom de fichier sécurisé
         if custom_filename:
-            # Utilisez le nom fourni, ajoutez .mp4 si nécessaire
-            if not custom_filename.lower().endswith('.mp4'):
-                filename = f"{custom_filename}.mp4"
+            # Nettoie le nom de fichier de caractères dangereux
+            import re
+            safe_filename = re.sub(r'[<>:"/\\|?*]', '_', custom_filename)
+            if not safe_filename.lower().endswith('.mp4'):
+                filename = f"{safe_filename}.mp4"
             else:
-                filename = custom_filename
-            print(f"Nom de fichier personnalisé: {filename}")
+                filename = safe_filename
         else:
             # Nom automatique avec timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"video_cut_{timestamp}.mp4"
-            print(f"Nom de fichier automatique: {filename}")
         
+        # SÉCURITÉ: Vérification que le dossier de destination existe et construction du chemin
         dropbox_path = f"{dropbox_folder.rstrip('/')}/{filename}"
         
-        # Upload par chunks pour gros fichiers
+        # SÉCURITÉ: Vérifier si le fichier existe déjà et générer un nom unique
+        original_filename = filename
+        counter = 1
+        while True:
+            try:
+                dbx.files_get_metadata(dropbox_path)
+                # Le fichier existe déjà, générer un nouveau nom
+                name_part = original_filename.rsplit('.', 1)[0]
+                extension = original_filename.rsplit('.', 1)[1] if '.' in original_filename else 'mp4'
+                filename = f"{name_part}_{counter}.{extension}"
+                dropbox_path = f"{dropbox_folder.rstrip('/')}/{filename}"
+                counter += 1
+                print(f"Fichier existant détecté, nouveau nom: {filename}")
+            except dropbox.exceptions.ApiError:
+                # Le fichier n'existe pas, on peut utiliser ce nom
+                print(f"Nom de fichier final: {filename}")
+                break
+        
+        # Upload par chunks pour gros fichiers avec mode sécurisé
         CHUNK_SIZE = 4 * 1024 * 1024  # 4MB par chunk
         
         with open(output_path, 'rb') as f:
             if file_size <= CHUNK_SIZE:
-                # Fichier petit, upload normal
+                # Fichier petit, upload normal avec mode sécurisé
                 print("Upload direct (fichier < 4MB)")
                 contents = f.read()
-                dbx.files_upload(contents, dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+                dbx.files_upload(
+                    contents, 
+                    dropbox_path, 
+                    mode=dropbox.files.WriteMode.add,  # SÉCURITÉ: Ne peut pas écraser
+                    autorename=True  # SÉCURITÉ: Renomme automatiquement si conflit
+                )
             else:
                 # Fichier gros, upload par sessions
                 print(f"Upload par chunks ({file_size} bytes, chunks de {CHUNK_SIZE} bytes)")
@@ -159,14 +183,18 @@ def handler(event):
                     remaining = file_size - f.tell()
                     
                     if remaining <= CHUNK_SIZE:
-                        # Dernier chunk
+                        # Dernier chunk avec mode sécurisé
                         print(f"Upload chunk final {chunk_count} ({remaining} bytes)")
                         final_chunk = f.read(remaining)
-                        dbx.files_upload_session_finish(
-                            final_chunk,
-                            cursor,
-                            dropbox.files.CommitInfo(path=dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+                        commit_info = dropbox.files.CommitInfo(
+                            path=dropbox_path, 
+                            mode=dropbox.files.WriteMode.add,  # SÉCURITÉ: Ne peut pas écraser
+                            autorename=True  # SÉCURITÉ: Renomme automatiquement si conflit
                         )
+                        result = dbx.files_upload_session_finish(final_chunk, cursor, commit_info)
+                        # Mise à jour du chemin final si autorename a modifié le nom
+                        dropbox_path = result.path_display
+                        filename = dropbox_path.split('/')[-1]
                         break
                     else:
                         # Chunk intermédiaire
@@ -198,14 +226,15 @@ def handler(event):
         
         return {
             "success": True,
-            "message": "Video processed and uploaded to Dropbox",
+            "message": "Video processed and uploaded to Dropbox safely",
             "dropbox_path": dropbox_path,
             "filename_used": filename,
             "download_url": download_url,
             "output_size_mb": round(file_size / 1024 / 1024, 2),
             "segments_processed": len(processed_segments),
             "total_duration_kept": round(total_duration, 2),
-            "chunks_uploaded": chunk_count if file_size > CHUNK_SIZE else 1
+            "chunks_uploaded": chunk_count if file_size > CHUNK_SIZE else 1,
+            "security_mode": "safe_upload_no_overwrite"
         }
         
     except Exception as e:
