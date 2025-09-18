@@ -22,31 +22,26 @@ def handler(event):
         
         # Traitement des segments avec gestion robuste du format
         if isinstance(cuts_data, dict) and 'segments' in cuts_data:
-            segments = cuts_data['segments']
+            segments_to_remove = cuts_data['segments']
         else:
-            segments = cuts_data
+            segments_to_remove = cuts_data
         
-        # Conversion des segments en format numérique
-        processed_segments = []
-        for segment in segments:
+        # Conversion des segments à SUPPRIMER en format numérique
+        remove_segments = []
+        for segment in segments_to_remove:
             start_str = str(segment['start']).rstrip('s')
             end_str = str(segment['end']).rstrip('s')
             
             try:
                 start = float(start_str)
                 end = float(end_str)
-                processed_segments.append({"start": start, "end": end})
-                print(f"Segment traité: {start}s → {end}s")
+                remove_segments.append({"start": start, "end": end})
+                print(f"Segment À SUPPRIMER: {start}s → {end}s")
             except ValueError as e:
                 print(f"Erreur conversion segment {segment}: {e}")
                 continue
         
-        if not processed_segments:
-            return {"error": "Aucun segment valide trouvé"}
-        
-        print(f"Segments finaux: {processed_segments}")
-        
-        # Télécharge la vidéo
+        # Télécharge la vidéo pour connaître sa durée totale
         print("Téléchargement de la vidéo...")
         response = requests.get(video_url, stream=True)
         response.raise_for_status()
@@ -58,12 +53,56 @@ def handler(event):
         
         print(f"Vidéo téléchargée: {input_path}")
         
-        # Création des filtres FFMPEG pour concaténer tous les segments
+        # NOUVEAU: Obtenir la durée totale de la vidéo avec ffprobe
+        duration_cmd = ['ffprobe', '-i', input_path, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'csv=p=0']
+        duration_result = subprocess.run(duration_cmd, capture_output=True, text=True)
+        
+        if duration_result.returncode != 0:
+            return {"error": "Impossible de déterminer la durée de la vidéo"}
+        
+        total_duration = float(duration_result.stdout.strip())
+        print(f"Durée totale de la vidéo: {total_duration}s")
+        
+        # LOGIQUE INVERSÉE: Calculer les segments à GARDER
+        remove_segments.sort(key=lambda x: x['start'])  # Trier par ordre chronologique
+        
+        keep_segments = []
+        current_time = 0.0
+        
+        for remove_segment in remove_segments:
+            remove_start = remove_segment['start']
+            remove_end = remove_segment['end']
+            
+            # Ajouter le segment avant la suppression (si il y a du contenu)
+            if current_time < remove_start:
+                keep_segments.append({
+                    "start": current_time,
+                    "end": remove_start
+                })
+                print(f"Segment À GARDER: {current_time}s → {remove_start}s")
+            
+            # Avancer le curseur après le segment supprimé
+            current_time = max(current_time, remove_end)
+        
+        # Ajouter le segment final (après la dernière suppression jusqu'à la fin)
+        if current_time < total_duration:
+            keep_segments.append({
+                "start": current_time,
+                "end": total_duration
+            })
+            print(f"Segment final À GARDER: {current_time}s → {total_duration}s")
+        
+        if not keep_segments:
+            return {"error": "Aucun segment à garder après suppression des passages ratés"}
+        
+        print(f"Segments finaux à garder: {keep_segments}")
+        
+        # Création des filtres FFMPEG pour concaténer tous les segments À GARDER
         output_path = '/tmp/output.mp4'
         
-        if len(processed_segments) == 1:
+        if len(keep_segments) == 1:
             # Un seul segment : découpe simple
-            segment = processed_segments[0]
+            segment = keep_segments[0]
             cmd = [
                 'ffmpeg', '-i', input_path,
                 '-ss', str(segment['start']),
@@ -74,17 +113,17 @@ def handler(event):
             # Plusieurs segments : utiliser filter_complex pour concaténation
             filter_parts = []
             
-            for i, segment in enumerate(processed_segments):
+            for i, segment in enumerate(keep_segments):
                 start = segment['start']
                 duration = segment['end'] - segment['start']
                 filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{i}]")
                 filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{i}]")
             
             # Concaténer tous les segments
-            video_inputs = ''.join([f"[v{i}]" for i in range(len(processed_segments))])
-            audio_inputs = ''.join([f"[a{i}]" for i in range(len(processed_segments))])
-            concat_filter = f"{video_inputs}concat=n={len(processed_segments)}:v=1:a=0[outv]"
-            concat_filter += f";{audio_inputs}concat=n={len(processed_segments)}:v=0:a=1[outa]"
+            video_inputs = ''.join([f"[v{i}]" for i in range(len(keep_segments))])
+            audio_inputs = ''.join([f"[a{i}]" for i in range(len(keep_segments))])
+            concat_filter = f"{video_inputs}concat=n={len(keep_segments)}:v=1:a=0[outv]"
+            concat_filter += f";{audio_inputs}concat=n={len(keep_segments)}:v=0:a=1[outa]"
             
             full_filter = ';'.join(filter_parts) + ';' + concat_filter
             
@@ -115,7 +154,6 @@ def handler(event):
         
         # SÉCURITÉ: Génération de nom de fichier sécurisé
         if custom_filename:
-            # Nettoie le nom de fichier de caractères dangereux
             import re
             safe_filename = re.sub(r'[<>:"/\\|?*]', '_', custom_filename)
             if not safe_filename.lower().endswith('.mp4'):
@@ -123,20 +161,16 @@ def handler(event):
             else:
                 filename = safe_filename
         else:
-            # Nom automatique avec timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"video_cut_{timestamp}.mp4"
         
-        # SÉCURITÉ: Vérification que le dossier de destination existe et construction du chemin
-        dropbox_path = f"{dropbox_folder.rstrip('/')}/{filename}"
-        
         # SÉCURITÉ: Vérifier si le fichier existe déjà et générer un nom unique
+        dropbox_path = f"{dropbox_folder.rstrip('/')}/{filename}"
         original_filename = filename
         counter = 1
         while True:
             try:
                 dbx.files_get_metadata(dropbox_path)
-                # Le fichier existe déjà, générer un nouveau nom
                 name_part = original_filename.rsplit('.', 1)[0]
                 extension = original_filename.rsplit('.', 1)[1] if '.' in original_filename else 'mp4'
                 filename = f"{name_part}_{counter}.{extension}"
@@ -144,7 +178,6 @@ def handler(event):
                 counter += 1
                 print(f"Fichier existant détecté, nouveau nom: {filename}")
             except dropbox.exceptions.ApiError:
-                # Le fichier n'existe pas, on peut utiliser ce nom
                 print(f"Nom de fichier final: {filename}")
                 break
         
@@ -153,20 +186,17 @@ def handler(event):
         
         with open(output_path, 'rb') as f:
             if file_size <= CHUNK_SIZE:
-                # Fichier petit, upload normal avec mode sécurisé
                 print("Upload direct (fichier < 4MB)")
                 contents = f.read()
                 dbx.files_upload(
                     contents, 
                     dropbox_path, 
-                    mode=dropbox.files.WriteMode.add,  # SÉCURITÉ: Ne peut pas écraser
-                    autorename=True  # SÉCURITÉ: Renomme automatiquement si conflit
+                    mode=dropbox.files.WriteMode.add,
+                    autorename=True
                 )
             else:
-                # Fichier gros, upload par sessions
                 print(f"Upload par chunks ({file_size} bytes, chunks de {CHUNK_SIZE} bytes)")
                 
-                # Premier chunk
                 first_chunk = f.read(CHUNK_SIZE)
                 session_start_result = dbx.files_upload_session_start(first_chunk)
                 cursor = dropbox.files.UploadSessionCursor(
@@ -176,28 +206,24 @@ def handler(event):
                 
                 print(f"Session démarrée: {session_start_result.session_id}")
                 
-                # Upload des chunks suivants
                 chunk_count = 1
                 while f.tell() < file_size:
                     chunk_count += 1
                     remaining = file_size - f.tell()
                     
                     if remaining <= CHUNK_SIZE:
-                        # Dernier chunk avec mode sécurisé
                         print(f"Upload chunk final {chunk_count} ({remaining} bytes)")
                         final_chunk = f.read(remaining)
                         commit_info = dropbox.files.CommitInfo(
                             path=dropbox_path, 
-                            mode=dropbox.files.WriteMode.add,  # SÉCURITÉ: Ne peut pas écraser
-                            autorename=True  # SÉCURITÉ: Renomme automatiquement si conflit
+                            mode=dropbox.files.WriteMode.add,
+                            autorename=True
                         )
                         result = dbx.files_upload_session_finish(final_chunk, cursor, commit_info)
-                        # Mise à jour du chemin final si autorename a modifié le nom
                         dropbox_path = result.path_display
                         filename = dropbox_path.split('/')[-1]
                         break
                     else:
-                        # Chunk intermédiaire
                         print(f"Upload chunk {chunk_count} ({CHUNK_SIZE} bytes)")
                         chunk_data = f.read(CHUNK_SIZE)
                         dbx.files_upload_session_append_v2(chunk_data, cursor)
@@ -222,19 +248,23 @@ def handler(event):
             pass
         
         # Calcul de la durée totale conservée
-        total_duration = sum(seg['end'] - seg['start'] for seg in processed_segments)
+        total_kept_duration = sum(seg['end'] - seg['start'] for seg in keep_segments)
+        total_removed_duration = sum(seg['end'] - seg['start'] for seg in remove_segments)
         
         return {
             "success": True,
-            "message": "Video processed and uploaded to Dropbox safely",
+            "message": "Video processed with segments removed successfully",
             "dropbox_path": dropbox_path,
             "filename_used": filename,
             "download_url": download_url,
             "output_size_mb": round(file_size / 1024 / 1024, 2),
-            "segments_processed": len(processed_segments),
-            "total_duration_kept": round(total_duration, 2),
+            "segments_removed": len(remove_segments),
+            "segments_kept": len(keep_segments),
+            "total_duration_kept": round(total_kept_duration, 2),
+            "total_duration_removed": round(total_removed_duration, 2),
+            "time_saved": f"{round(total_removed_duration, 2)}s",
             "chunks_uploaded": chunk_count if file_size > CHUNK_SIZE else 1,
-            "security_mode": "safe_upload_no_overwrite"
+            "logic": "inverted_to_keep_good_content"
         }
         
     except Exception as e:
