@@ -16,32 +16,48 @@ def handler(event):
         custom_filename = event['input'].get('filename', None)
         
         print(f"URL vidéo: {video_url}")
-        print(f"Découpes brutes: {cuts_data}")
+        print(f"Données cuts reçues: {cuts_data}")
         print(f"Upload vers: {dropbox_folder}")
         print(f"Nom fichier personnalisé: {custom_filename}")
         
-        # Traitement des segments avec gestion robuste du format
-        if isinstance(cuts_data, dict) and 'segments' in cuts_data:
-            segments_to_remove = cuts_data['segments']
+        # Traitement du nouveau format JSON consolidé
+        if isinstance(cuts_data, dict) and 'cuts' in cuts_data:
+            segments = cuts_data['cuts']
+        elif isinstance(cuts_data, list):
+            segments = cuts_data
         else:
-            segments_to_remove = cuts_data
+            # Fallback pour ancien format
+            if isinstance(cuts_data, dict) and 'segments' in cuts_data:
+                segments = cuts_data['segments']
+            else:
+                segments = cuts_data
         
-        # Conversion des segments à SUPPRIMER en format numérique
-        remove_segments = []
-        for segment in segments_to_remove:
-            start_str = str(segment['start']).rstrip('s')
-            end_str = str(segment['end']).rstrip('s')
-            
+        print(f"Segments extraits: {len(segments) if isinstance(segments, list) else 'format invalide'}")
+        
+        # Conversion des segments en format numérique (millisecondes vers secondes)
+        processed_segments = []
+        for segment in segments:
             try:
-                start = float(start_str)
-                end = float(end_str)
-                remove_segments.append({"start": start, "end": end})
-                print(f"Segment À SUPPRIMER: {start}s → {end}s")
-            except ValueError as e:
+                # Les timestamps du JSON consolidé sont déjà en millisecondes
+                start_ms = float(segment['start'])
+                end_ms = float(segment['end'])
+                
+                # Convertir en secondes pour FFMPEG
+                start_sec = start_ms / 1000
+                end_sec = end_ms / 1000
+                
+                processed_segments.append({"start": start_sec, "end": end_sec})
+                print(f"Segment traité: {start_sec}s → {end_sec}s (type: {segment.get('type', 'unknown')})")
+            except (ValueError, KeyError) as e:
                 print(f"Erreur conversion segment {segment}: {e}")
                 continue
         
-        # Télécharge la vidéo pour connaître sa durée totale
+        if not processed_segments:
+            return {"error": "Aucun segment valide trouvé"}
+        
+        print(f"Segments finaux: {processed_segments}")
+        
+        # Télécharge la vidéo
         print("Téléchargement de la vidéo...")
         response = requests.get(video_url, stream=True)
         response.raise_for_status()
@@ -53,56 +69,12 @@ def handler(event):
         
         print(f"Vidéo téléchargée: {input_path}")
         
-        # NOUVEAU: Obtenir la durée totale de la vidéo avec ffprobe
-        duration_cmd = ['ffprobe', '-i', input_path, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'csv=p=0']
-        duration_result = subprocess.run(duration_cmd, capture_output=True, text=True)
-        
-        if duration_result.returncode != 0:
-            return {"error": "Impossible de déterminer la durée de la vidéo"}
-        
-        total_duration = float(duration_result.stdout.strip())
-        print(f"Durée totale de la vidéo: {total_duration}s")
-        
-        # LOGIQUE INVERSÉE: Calculer les segments à GARDER
-        remove_segments.sort(key=lambda x: x['start'])  # Trier par ordre chronologique
-        
-        keep_segments = []
-        current_time = 0.0
-        
-        for remove_segment in remove_segments:
-            remove_start = remove_segment['start']
-            remove_end = remove_segment['end']
-            
-            # Ajouter le segment avant la suppression (si il y a du contenu)
-            if current_time < remove_start:
-                keep_segments.append({
-                    "start": current_time,
-                    "end": remove_start
-                })
-                print(f"Segment À GARDER: {current_time}s → {remove_start}s")
-            
-            # Avancer le curseur après le segment supprimé
-            current_time = max(current_time, remove_end)
-        
-        # Ajouter le segment final (après la dernière suppression jusqu'à la fin)
-        if current_time < total_duration:
-            keep_segments.append({
-                "start": current_time,
-                "end": total_duration
-            })
-            print(f"Segment final À GARDER: {current_time}s → {total_duration}s")
-        
-        if not keep_segments:
-            return {"error": "Aucun segment à garder après suppression des passages ratés"}
-        
-        print(f"Segments finaux à garder: {keep_segments}")
-        
-        # Création des filtres FFMPEG pour concaténer tous les segments À GARDER
+        # Création des filtres FFMPEG pour concaténer tous les segments
         output_path = '/tmp/output.mp4'
         
-        if len(keep_segments) == 1:
+        if len(processed_segments) == 1:
             # Un seul segment : découpe simple
-            segment = keep_segments[0]
+            segment = processed_segments[0]
             cmd = [
                 'ffmpeg', '-i', input_path,
                 '-ss', str(segment['start']),
@@ -113,17 +85,17 @@ def handler(event):
             # Plusieurs segments : utiliser filter_complex pour concaténation
             filter_parts = []
             
-            for i, segment in enumerate(keep_segments):
+            for i, segment in enumerate(processed_segments):
                 start = segment['start']
                 duration = segment['end'] - segment['start']
                 filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{i}]")
                 filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{i}]")
             
             # Concaténer tous les segments
-            video_inputs = ''.join([f"[v{i}]" for i in range(len(keep_segments))])
-            audio_inputs = ''.join([f"[a{i}]" for i in range(len(keep_segments))])
-            concat_filter = f"{video_inputs}concat=n={len(keep_segments)}:v=1:a=0[outv]"
-            concat_filter += f";{audio_inputs}concat=n={len(keep_segments)}:v=0:a=1[outa]"
+            video_inputs = ''.join([f"[v{i}]" for i in range(len(processed_segments))])
+            audio_inputs = ''.join([f"[a{i}]" for i in range(len(processed_segments))])
+            concat_filter = f"{video_inputs}concat=n={len(processed_segments)}:v=1:a=0[outv]"
+            concat_filter += f";{audio_inputs}concat=n={len(processed_segments)}:v=0:a=1[outa]"
             
             full_filter = ';'.join(filter_parts) + ';' + concat_filter
             
@@ -152,7 +124,7 @@ def handler(event):
         
         dbx = dropbox.Dropbox(dropbox_token)
         
-        # SÉCURITÉ: Génération de nom de fichier sécurisé
+        # Génération de nom de fichier sécurisé
         if custom_filename:
             import re
             safe_filename = re.sub(r'[<>:"/\\|?*]', '_', custom_filename)
@@ -164,7 +136,7 @@ def handler(event):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"video_cut_{timestamp}.mp4"
         
-        # SÉCURITÉ: Vérifier si le fichier existe déjà et générer un nom unique
+        # Vérification que le fichier n'existe pas déjà
         dropbox_path = f"{dropbox_folder.rstrip('/')}/{filename}"
         original_filename = filename
         counter = 1
@@ -181,7 +153,7 @@ def handler(event):
                 print(f"Nom de fichier final: {filename}")
                 break
         
-        # Upload par chunks pour gros fichiers avec mode sécurisé
+        # Upload par chunks pour gros fichiers
         CHUNK_SIZE = 4 * 1024 * 1024  # 4MB par chunk
         
         with open(output_path, 'rb') as f:
@@ -248,23 +220,19 @@ def handler(event):
             pass
         
         # Calcul de la durée totale conservée
-        total_kept_duration = sum(seg['end'] - seg['start'] for seg in keep_segments)
-        total_removed_duration = sum(seg['end'] - seg['start'] for seg in remove_segments)
+        total_duration = sum(seg['end'] - seg['start'] for seg in processed_segments)
         
         return {
             "success": True,
-            "message": "Video processed with segments removed successfully",
+            "message": "Video processed and uploaded to Dropbox safely",
             "dropbox_path": dropbox_path,
             "filename_used": filename,
             "download_url": download_url,
             "output_size_mb": round(file_size / 1024 / 1024, 2),
-            "segments_removed": len(remove_segments),
-            "segments_kept": len(keep_segments),
-            "total_duration_kept": round(total_kept_duration, 2),
-            "total_duration_removed": round(total_removed_duration, 2),
-            "time_saved": f"{round(total_removed_duration, 2)}s",
+            "segments_processed": len(processed_segments),
+            "total_duration_kept": round(total_duration, 2),
             "chunks_uploaded": chunk_count if file_size > CHUNK_SIZE else 1,
-            "logic": "inverted_to_keep_good_content"
+            "security_mode": "safe_upload_no_overwrite"
         }
         
     except Exception as e:
