@@ -7,6 +7,39 @@ import dropbox
 import json
 from datetime import datetime
 
+def invert_cuts_to_keeps(cuts, total_duration):
+    """Convertit les cuts (à supprimer) en segments à garder"""
+    if not cuts:
+        return [{"start": 0, "end": total_duration}]
+    
+    keeps = []
+    cuts_sorted = sorted(cuts, key=lambda x: x['start'])
+    
+    print(f"Cuts triés: {cuts_sorted}")
+    print(f"Durée totale: {total_duration}")
+    
+    # Segment avant le premier cut
+    if cuts_sorted[0]['start'] > 0.1:  # Si > 100ms
+        keeps.append({"start": 0, "end": cuts_sorted[0]['start']})
+        print(f"Segment initial: 0 → {cuts_sorted[0]['start']}")
+    
+    # Segments entre les cuts
+    for i in range(len(cuts_sorted) - 1):
+        start = cuts_sorted[i]['end']
+        end = cuts_sorted[i + 1]['start']
+        if end > start + 0.1:  # Garder seulement si > 100ms
+            keeps.append({"start": start, "end": end})
+            print(f"Segment entre cuts: {start} → {end}")
+    
+    # Segment après le dernier cut
+    last_cut_end = cuts_sorted[-1]['end']
+    if last_cut_end < total_duration - 0.1:
+        keeps.append({"start": last_cut_end, "end": total_duration})
+        print(f"Segment final: {last_cut_end} → {total_duration}")
+    
+    print(f"Segments à garder générés: {keeps}")
+    return keeps
+
 def handler(event):
     try:
         print("Début du traitement")
@@ -35,8 +68,8 @@ def handler(event):
         
         print(f"Segments extraits: {len(segments) if isinstance(segments, list) else 'format invalide'}")
         
-        # Conversion des segments en format numérique
-        processed_segments = []
+        # Conversion des segments en format numérique (cuts à supprimer)
+        cuts_to_remove = []
         for segment in segments:
             try:
                 # Normalisation des timestamps (gérer ms/s selon la valeur)
@@ -51,16 +84,14 @@ def handler(event):
                     start_sec = start_val
                     end_sec = end_val
                 
-                processed_segments.append({"start": start_sec, "end": end_sec})
-                print(f"Segment traité: {start_sec}s → {end_sec}s (type: {segment.get('type', 'unknown')})")
+                cuts_to_remove.append({"start": start_sec, "end": end_sec})
+                print(f"Cut à supprimer: {start_sec}s → {end_sec}s (type: {segment.get('type', 'unknown')})")
             except (ValueError, KeyError) as e:
                 print(f"Erreur conversion segment {segment}: {e}")
                 continue
         
-        if not processed_segments:
-            return {"error": "Aucun segment valide trouvé"}
-        
-        print(f"Segments finaux: {processed_segments}")
+        if not cuts_to_remove:
+            return {"error": "Aucun cut valide trouvé"}
         
         # Télécharge la vidéo
         print("Téléchargement de la vidéo...")
@@ -73,6 +104,23 @@ def handler(event):
             input_path = temp_video.name
         
         print(f"Vidéo téléchargée: {input_path}")
+        
+        # Obtenir la durée totale du fichier
+        duration_cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', input_path]
+        duration_result = subprocess.run(duration_cmd, capture_output=True, text=True)
+        
+        if duration_result.returncode != 0:
+            print(f"Erreur obtention durée: {duration_result.stderr}")
+            return {"error": f"Impossible d'obtenir la durée: {duration_result.stderr}"}
+        
+        total_duration = float(duration_result.stdout.strip())
+        print(f"Durée totale fichier: {total_duration}s")
+        
+        # Convertir les cuts en segments à garder
+        processed_segments = invert_cuts_to_keeps(cuts_to_remove, total_duration)
+        
+        if not processed_segments:
+            return {"error": "Aucun segment à garder après inversion"}
         
         # Analyse du fichier pour détecter audio/vidéo
         probe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', input_path]
@@ -108,14 +156,23 @@ def handler(event):
                 for i, segment in enumerate(processed_segments):
                     start = segment['start']
                     duration = segment['end'] - segment['start']
+                    if duration < 0.1:  # Ignorer segments trop courts
+                        print(f"Segment {i} ignoré (trop court): {duration}s")
+                        continue
                     filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{i}]")
                     filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{i}]")
                 
+                if not filter_parts:
+                    return {"error": "Tous les segments sont trop courts"}
+                
+                # Compter les segments valides
+                valid_segments = len(filter_parts) // 2
+                
                 # Concaténer tous les segments
-                video_inputs = ''.join([f"[v{i}]" for i in range(len(processed_segments))])
-                audio_inputs = ''.join([f"[a{i}]" for i in range(len(processed_segments))])
-                concat_filter = f"{video_inputs}concat=n={len(processed_segments)}:v=1:a=0[outv]"
-                concat_filter += f";{audio_inputs}concat=n={len(processed_segments)}:v=0:a=1[outa]"
+                video_inputs = ''.join([f"[v{i}]" for i in range(valid_segments)])
+                audio_inputs = ''.join([f"[a{i}]" for i in range(valid_segments)])
+                concat_filter = f"{video_inputs}concat=n={valid_segments}:v=1:a=0[outv]"
+                concat_filter += f";{audio_inputs}concat=n={valid_segments}:v=0:a=1[outa]"
                 
                 full_filter = ';'.join(filter_parts) + ';' + concat_filter
                 
@@ -134,10 +191,16 @@ def handler(event):
                 for i, segment in enumerate(processed_segments):
                     start = segment['start']
                     duration = segment['end'] - segment['start']
+                    if duration < 0.1:
+                        continue
                     filter_parts.append(f"[0:a]atrim=start={start}:duration={duration},asetpts=PTS-STARTPTS[a{i}]")
                 
-                audio_inputs = ''.join([f"[a{i}]" for i in range(len(processed_segments))])
-                concat_filter = f"{audio_inputs}concat=n={len(processed_segments)}:v=0:a=1[outa]"
+                if not filter_parts:
+                    return {"error": "Tous les segments audio sont trop courts"}
+                
+                valid_segments = len(filter_parts)
+                audio_inputs = ''.join([f"[a{i}]" for i in range(valid_segments)])
+                concat_filter = f"{audio_inputs}concat=n={valid_segments}:v=0:a=1[outa]"
                 
                 full_filter = ';'.join(filter_parts) + ';' + concat_filter
                 
@@ -155,10 +218,16 @@ def handler(event):
                 for i, segment in enumerate(processed_segments):
                     start = segment['start']
                     duration = segment['end'] - segment['start']
+                    if duration < 0.1:
+                        continue
                     filter_parts.append(f"[0:v]trim=start={start}:duration={duration},setpts=PTS-STARTPTS[v{i}]")
                 
-                video_inputs = ''.join([f"[v{i}]" for i in range(len(processed_segments))])
-                concat_filter = f"{video_inputs}concat=n={len(processed_segments)}:v=1:a=0[outv]"
+                if not filter_parts:
+                    return {"error": "Tous les segments vidéo sont trop courts"}
+                
+                valid_segments = len(filter_parts)
+                video_inputs = ''.join([f"[v{i}]" for i in range(valid_segments)])
+                concat_filter = f"{video_inputs}concat=n={valid_segments}:v=1:a=0[outv]"
                 
                 full_filter = ';'.join(filter_parts) + ';' + concat_filter
                 
@@ -284,7 +353,7 @@ def handler(event):
             pass
         
         # Calcul de la durée totale conservée
-        total_duration = sum(seg['end'] - seg['start'] for seg in processed_segments)
+        total_duration_kept = sum(seg['end'] - seg['start'] for seg in processed_segments)
         
         return {
             "success": True,
@@ -294,9 +363,10 @@ def handler(event):
             "download_url": download_url,
             "output_size_mb": round(file_size / 1024 / 1024, 2),
             "segments_processed": len(processed_segments),
-            "total_duration_kept": round(total_duration, 2),
+            "total_duration_kept": round(total_duration_kept, 2),
             "chunks_uploaded": chunk_count if file_size > CHUNK_SIZE else 1,
             "media_type": f"video: {has_video}, audio: {has_audio}",
+            "cuts_removed": len(cuts_to_remove),
             "security_mode": "safe_upload_no_overwrite"
         }
         
