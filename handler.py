@@ -94,17 +94,16 @@ def handler(event):
         cuts_to_remove = []
         for segment in segments:
             try:
-                # Normalisation des timestamps (gérer ms/s selon la valeur)
                 start_val = float(segment['start'])
                 end_val = float(segment['end'])
                 
-                # Si valeurs > 1000, probablement en millisecondes
-                if start_val > 1000:
-                    start_sec = start_val / 1000
-                    end_sec = end_val / 1000
-                else:
-                    start_sec = start_val
-                    end_sec = end_val
+                print(f"Segment brut: start={start_val}, end={end_val}")
+                
+                # CORRECTION : Tous les timecodes du JSON Claude sont en millisecondes
+                # Conversion systématique ms → secondes
+                start_sec = start_val / 1000
+                end_sec = end_val / 1000
+                print(f"Converti ms→s: {start_val}ms→{start_sec}s, {end_val}ms→{end_sec}s")
                 
                 cuts_to_remove.append({"start": start_sec, "end": end_sec})
                 print(f"Cut à supprimer: {start_sec}s → {end_sec}s (type: {segment.get('type', 'unknown')})")
@@ -114,6 +113,12 @@ def handler(event):
         
         if not cuts_to_remove:
             return {"error": "Aucun cut valide trouvé"}
+        
+        print(f"\n=== RÉSUMÉ CUTS À SUPPRIMER ===")
+        for i, cut in enumerate(cuts_to_remove):
+            duration = cut['end'] - cut['start']
+            print(f"Cut {i}: {cut['start']:.3f}s → {cut['end']:.3f}s (durée: {duration:.3f}s)")
+        print("================================")
         
         # Télécharge la vidéo
         print("Téléchargement de la vidéo...")
@@ -143,8 +148,14 @@ def handler(event):
         
         if not processed_segments:
             print("ERREUR: Aucun segment généré après inversion")
-            print("Cela peut signifier que tous les cuts couvrent la totalité du fichier")
-            return {"error": "Aucun segment à garder après inversion - vérifiez que les cuts ne couvrent pas tout le fichier"}
+            
+            # Debug supplémentaire
+            total_cut_duration = sum(cut['end'] - cut['start'] for cut in cuts_to_remove)
+            coverage_percent = (total_cut_duration / total_duration) * 100
+            print(f"Durée totale des cuts: {total_cut_duration:.3f}s")
+            print(f"Couverture: {coverage_percent:.1f}% du fichier")
+            
+            return {"error": f"Aucun segment à garder après inversion - cuts couvrent {coverage_percent:.1f}% du fichier ({total_cut_duration:.1f}s sur {total_duration:.1f}s)"}
         
         print("=== SEGMENTS À TRAITER PAR FFMPEG ===")
         for i, keep in enumerate(processed_segments):
